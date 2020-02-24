@@ -54,29 +54,15 @@ type Relay struct {
 	relays map[peer.ID]struct{}
 	mx     sync.Mutex
 
+	filter Acceptor
+
 	// atomic counters
 	streamCount  int32
 	liveHopCount int32
 }
 
-// RelayOpts are options for configuring the relay transport.
-type RelayOpt int
-
-var (
-	// OptActive configures the relay transport to actively establish
-	// outbound connections on behalf of clients. You probably don't want to
-	// enable this unless you know what you're doing.
-	OptActive = RelayOpt(0)
-	// OptHop configures the relay transport to accept requests to relay
-	// traffic on behalf of third-parties. Unless OptActive is specified,
-	// this will only relay traffic between peers already connected to this
-	// node.
-	OptHop = RelayOpt(1)
-	// OptDiscovery configures this relay transport to discover new relays
-	// by probing every new peer. You almost _certainly_ don't want to
-	// enable this.
-	OptDiscovery = RelayOpt(2)
-)
+// RelayOpts are function for configuring the relay transport.
+type RelayOpt func(*Relay) error
 
 type RelayError struct {
 	Code pb.CircuitRelay_Status
@@ -95,18 +81,13 @@ func NewRelay(ctx context.Context, h host.Host, upgrader *tptu.Upgrader, opts ..
 		self:     h.ID(),
 		incoming: make(chan *Conn),
 		relays:   make(map[peer.ID]struct{}),
+		filter:   DefaultFilter{},
 	}
 
 	for _, opt := range opts {
-		switch opt {
-		case OptActive:
-			r.active = true
-		case OptHop:
-			r.hop = true
-		case OptDiscovery:
-			r.discovery = true
-		default:
-			return nil, fmt.Errorf("unrecognized option: %d", opt)
+		err := opt(r)
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -303,6 +284,11 @@ func (r *Relay) handleHopStream(s network.Stream, msg *pb.CircuitRelay) {
 		return
 	}
 
+	if !r.filter.HopConn(s, dst) {
+		r.handleError(s, pb.CircuitRelay_HOP_RELAY_REFUSED)
+		return
+	}
+
 	// open stream
 	ctx, cancel := context.WithTimeout(r.ctx, HopConnectTimeout)
 	defer cancel()
@@ -461,7 +447,11 @@ func (r *Relay) handleCanHop(s network.Stream, msg *pb.CircuitRelay) {
 	var err error
 
 	if r.hop {
-		err = r.writeResponse(s, pb.CircuitRelay_SUCCESS)
+		if r.filter.CanHop(s) {
+			err = r.writeResponse(s, pb.CircuitRelay_SUCCESS)
+		} else {
+			err = r.writeResponse(s, pb.CircuitRelay_HOP_RELAY_REFUSED)
+		}
 	} else {
 		err = r.writeResponse(s, pb.CircuitRelay_HOP_CANT_SPEAK_RELAY)
 	}
